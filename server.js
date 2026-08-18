@@ -24,7 +24,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.post('/api/submit', async (req, res) => {
   try {
-    const { design, summary, contact } = req.body || {};
+    const { design, summary, contact, png } = req.body || {};
     if (!design || !contact || !contact.email || !contact.name) {
       return res.status(400).json({ error: 'missing design or contact details' });
     }
@@ -35,6 +35,19 @@ app.post('/api/submit', async (req, res) => {
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
     });
     const safeName = String(contact.name).replace(/[^\w\s-]/g, '').trim() || 'client';
+    const fileBase = safeName.toLowerCase().replace(/\s+/g, '-');
+    const attachments = [{
+      filename: fileBase + '.wallart.json',
+      content: JSON.stringify(design),
+      contentType: 'application/json',
+    }];
+    if (typeof png === 'string' && png.length > 100 && png.length < 12_000_000) {
+      attachments.push({
+        filename: fileBase + '-mockup.png',
+        content: Buffer.from(png, 'base64'),
+        contentType: 'image/png',
+      });
+    }
     await transporter.sendMail({
       from: `"Wall Art Mock-Up" <${process.env.SMTP_USER}>`,
       to: process.env.MAIL_TO || 'amy@amygray.net',
@@ -43,12 +56,8 @@ app.post('/api/submit', async (req, res) => {
       text: `${summary || ''}\n\nFrom: ${safeName} <${contact.email}>` +
         (contact.phone ? ` · ${contact.phone}` : '') +
         (contact.note ? `\n\nNote from the client:\n${contact.note}` : '') +
-        '\n\nThe attached .wallart.json opens in the mock-up app with the Open button.',
-      attachments: [{
-        filename: safeName.toLowerCase().replace(/\s+/g, '-') + '.wallart.json',
-        content: JSON.stringify(design),
-        contentType: 'application/json',
-      }],
+        '\n\nThe -mockup.png shows the design; the .wallart.json opens in the mock-up app with the Open button (photos included).',
+      attachments,
     });
     res.json({ ok: true });
   } catch (err) {
