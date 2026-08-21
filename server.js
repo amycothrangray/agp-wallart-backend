@@ -127,7 +127,7 @@ app.get('/api/blog/site', requireBlogKey, async (req, res) => {
 /* Upload one resized photo to the WordPress media library. */
 app.post('/api/blog/media', requireBlogKey, async (req, res) => {
   try {
-    const { filename, dataBase64, alt, title } = req.body || {};
+    const { filename, dataBase64, alt, title, caption, description } = req.body || {};
     if (!filename || !dataBase64) return res.status(400).json({ error: 'missing file' });
     const buf = Buffer.from(dataBase64, 'base64');
     if (buf.length > 12_000_000) return res.status(413).json({ error: 'image too large' });
@@ -145,11 +145,16 @@ app.post('/api/blog/media', requireBlogKey, async (req, res) => {
       return res.status(502).json({ error: 'WordPress rejected the upload' });
     }
     const id = up.body.id;
-    if (alt || title) {
+    if (alt || title || caption || description) {
       await wpFetch(`/wp-json/wp/v2/media/${id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ alt_text: alt || '', title: title || safe }),
+        body: JSON.stringify({
+          alt_text: alt || '',
+          title: title || safe,
+          ...(caption ? { caption } : {}),
+          ...(description ? { description } : {}),
+        }),
       });
     }
     res.json({ id, url: up.body.source_url });
@@ -205,7 +210,7 @@ app.post('/api/blog/publish', requireBlogKey, async (req, res) => {
 app.post('/api/blog/suggest', requireBlogKey, async (req, res) => {
   try {
     if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
-    const { title, location, text, thumbs } = req.body || {};
+    const { title, location, text, thumbs, keywords } = req.body || {};
     let site = siteCache.data;
     if (!site) {
       try {
@@ -238,16 +243,27 @@ ${(text || '(no text yet)').slice(0, 6000)}
 Existing pages and posts on the site (for internal links — use ONLY these URLs):
 ${internalList.slice(0, 8000)}
 
+Keywords Amy is actively trying to rank for. Work the relevant ones in naturally —
+never stuff them, and never use one that doesn't genuinely fit this session:
+${(Array.isArray(keywords) && keywords.length ? keywords : ['san diego family photographer']).join(', ')}
+
 Return ONLY a JSON object, no markdown fences, with keys:
 "titleOptions": 3 SEO title options in Amy's style "Location Type Photos | Emotional Hook" (e.g. "Hotel del Coronado Family Photos | Before the Next Chapter Begins")
 "slug": url slug for the best title
-"metaDescription": max 155 chars, warm, includes location + "family photographer" style keywords
+"metaDescription": max 155 chars, warm, includes location + the most relevant target keyword
 "excerpt": 1-2 sentence excerpt
-"focusKeyword": short focus keyphrase
-"altTexts": array, one entry per photo in order, each a descriptive alt text (max 12 words) mentioning what is happening and the location — write from the actual photo
+"focusKeyword": short focus keyphrase — pick from Amy's keyword list above when one fits
+"secondaryKeywords": 2-4 more from her list that this post can realistically support
+"altTexts": array, one entry per photo in order, each a descriptive alt text (max 12 words) mentioning what is happening and the location — write from the actual photo. Vary them; work a target keyword into 2-3 of them only where it honestly describes the picture.
 "imageFilenames": array, one per photo, an seo-friendly jpeg filename (kebab-case, include location, no extension)
-"internalLinks": 3-5 items {"title","url","why"} chosen from the list above, most relevant first
-"externalLinks": 2-3 items {"title","url","why"} — official venue/location/tourism pages relevant to this post (well-known URLs only)
+"inlineLinks": THE MOST IMPORTANT FIELD. Links to weave into the body text itself.
+   3-6 items {"phrase","url","title","kind","why"} where:
+     - "phrase" MUST be a short word-for-word quote (2-6 words) copied EXACTLY from the post text above, including its exact capitalisation. Never invent a phrase that is not in the text. Pick natural anchor text (a place name, an activity, a phrase like "beach family session").
+     - "url" is either one of Amy's URLs listed above (kind: "internal") or an official outside site for a venue/attraction/location mentioned in the text, e.g. SeaWorld, Hotel del Coronado, Balboa Park (kind: "external"). Only well-known official URLs.
+     - Prefer a mix: at least one internal and at least one external when the text supports it.
+     - Each phrase must be distinct and appear only once in your list.
+"internalLinks": 2-4 items {"title","url","why"} for the "keep exploring" list at the end (do not duplicate inlineLinks)
+"externalLinks": 1-2 items {"title","url","why"} — official venue/location pages, for the end list
 "categoryHints": array of likely category names`,
     });
 
