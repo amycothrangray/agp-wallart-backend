@@ -254,8 +254,6 @@ Return ONLY a JSON object, no markdown fences, with keys:
 "excerpt": 1-2 sentence excerpt
 "focusKeyword": short focus keyphrase — pick from Amy's keyword list above when one fits
 "secondaryKeywords": 2-4 more from her list that this post can realistically support
-"altTexts": array, one entry per photo in order, each a descriptive alt text (max 12 words) mentioning what is happening and the location — write from the actual photo. Vary them; work a target keyword into 2-3 of them only where it honestly describes the picture.
-"imageFilenames": array, one per photo, an seo-friendly jpeg filename (kebab-case, include location, no extension)
 "inlineLinks": THE MOST IMPORTANT FIELD. Links to weave into the body text itself.
    3-6 items {"phrase","url","title","kind","why"} where:
      - "phrase" MUST be a short word-for-word quote (2-6 words) copied EXACTLY from the post text above, including its exact capitalisation. Never invent a phrase that is not in the text. Pick natural anchor text (a place name, an activity, a phrase like "beach family session").
@@ -306,6 +304,73 @@ Return ONLY a JSON object, no markdown fences, with keys:
   } catch (err) {
     console.error('suggest failed:', err.message);
     res.status(500).json({ error: 'suggestions failed' });
+  }
+});
+
+/* Alt text + filenames for a batch of photos. Kept separate from /suggest so a
+   post with 30+ photos works: the frontend sends them in small batches instead
+   of one giant request that would overflow the reply limit. */
+app.post('/api/blog/alt', requireBlogKey, async (req, res) => {
+  try {
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+    const { title, location, keywords, thumbs, startIndex } = req.body || {};
+    const list = Array.isArray(thumbs) ? thumbs.slice(0, 10) : [];
+    if (!list.length) return res.json({ altTexts: [], imageFilenames: [] });
+
+    const content = [];
+    list.forEach((t, i) => {
+      content.push({ type: 'text', text: `Photo ${i + 1}:` });
+      content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: t.dataBase64 } });
+    });
+    content.push({
+      type: 'text',
+      text:
+`These are photos from a blog post for Amy Gray Photography, a San Diego family photographer.
+
+Post title: ${title || '(untitled)'}
+Location: ${location || '(unknown)'}
+Keywords Amy wants to rank for: ${(Array.isArray(keywords) && keywords.length ? keywords : ['San Diego family photographer']).join(', ')}
+
+For EACH of the ${list.length} photos, in order, write:
+- alt text: describe what is actually happening in that specific photo (who, what, where) in at most 14 words. Every one must be different from the others — never repeat a generic line. Mention the location naturally in some of them. Work a keyword in ONLY where it honestly describes the picture.
+- a filename: kebab-case, descriptive, includes the location, no extension.
+
+Return ONLY JSON, no markdown fences:
+{"altTexts":["...", ...], "imageFilenames":["...", ...]}
+Both arrays must have exactly ${list.length} entries, in the same order as the photos.`,
+    });
+
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 3000, messages: [{ role: 'user', content }] }),
+    });
+    const body = await r.json();
+    if (!r.ok) {
+      console.error('alt anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
+      return res.status(502).json({ error: 'AI request failed' });
+    }
+    let out = (body.content || []).map(c => c.text || '').join('');
+    out = out.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
+    const a = out.indexOf('{'), b = out.lastIndexOf('}');
+    let parsed;
+    try { parsed = JSON.parse(out.slice(a, b + 1)); }
+    catch (e) {
+      console.error('alt parse failed:', e.message, 'stop_reason=', body.stop_reason);
+      return res.status(502).json({ error: 'the AI reply was cut short — try again' });
+    }
+    res.json({
+      altTexts: parsed.altTexts || [],
+      imageFilenames: parsed.imageFilenames || [],
+      startIndex: startIndex || 0,
+    });
+  } catch (err) {
+    console.error('alt failed:', err.message);
+    res.status(500).json({ error: 'alt text failed' });
   }
 });
 
