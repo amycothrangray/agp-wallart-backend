@@ -369,6 +369,135 @@ function mountBlogRoutes(app, cfg) {
       res.status(500).json({ error: 'alt text failed' });
     }
   });
+
+  /* Look at a batch of photos and report what is in them, so the layout can
+     follow the house rules (most people first, silhouettes last, whole-group
+     shots on their own). */
+  app.post(base + '/analyze', requireKey, async (req, res) => {
+    try {
+      if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+      const { thumbs } = req.body || {};
+      const list = Array.isArray(thumbs) ? thumbs.slice(0, 8) : [];
+      if (!list.length) return res.json({ photos: [] });
+
+      const content = [];
+      list.forEach((t, i) => {
+        content.push({ type: 'text', text: `Photo ${i + 1}:` });
+        content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: t.dataBase64 } });
+      });
+      content.push({
+        type: 'text',
+        text:
+`Look carefully at each of these ${list.length} photos and report what is in them.
+
+For EACH photo, in order, return an object with:
+"people": how many people are visible (a number; 0 if none)
+"fullGroup": true only if this looks like the WHOLE group together in one frame — everyone the post is about, posed or moving together. A photo of one or two members of a larger group is false.
+"silhouette": true if the subjects are backlit and read as dark shapes against a bright sky or water — a true silhouette, not merely a moody or backlit photo
+"closeup": true if it is a tight portrait or detail (hands, feet, rings, a face filling the frame)
+"candid": true if it is an unposed moment — laughing, running, playing, mid-motion
+"subjects": very short phrase for who is in it, e.g. "whole family", "mom and baby", "the two brothers"
+"description": one short sentence describing what is happening
+
+Return ONLY JSON, no markdown fences:
+{"photos":[{"people":0,"fullGroup":false,"silhouette":false,"closeup":false,"candid":false,"subjects":"","description":""}]}
+The array must have exactly ${list.length} entries, in the same order as the photos.`,
+      });
+
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 3000, messages: [{ role: 'user', content }] }),
+      });
+      const body = await r.json();
+      if (!r.ok) {
+        console.error(base, 'analyze anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
+        return res.status(502).json({ error: 'AI request failed' });
+      }
+      let out = (body.content || []).map(c => c.text || '').join('');
+      out = out.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
+      const a = out.indexOf('{'), b = out.lastIndexOf('}');
+      let parsed;
+      try { parsed = JSON.parse(out.slice(a, b + 1)); }
+      catch (e) {
+        console.error(base, 'analyze parse failed:', e.message, 'stop_reason=', body.stop_reason);
+        return res.status(502).json({ error: 'the AI reply was cut short — try again' });
+      }
+      res.json({ photos: parsed.photos || [] });
+    } catch (err) {
+      console.error(base, 'analyze failed:', err.message);
+      res.status(500).json({ error: 'photo analysis failed' });
+    }
+  });
+
+  /* Read the post text against what we know about each photo and work out which
+     photos the words are pointing at ("our favourite shot", "the funny moment"). */
+  app.post(base + '/moments', requireKey, async (req, res) => {
+    try {
+      if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+      const { paragraphs, photos } = req.body || {};
+      const paras = Array.isArray(paragraphs) ? paragraphs : [];
+      const pics = Array.isArray(photos) ? photos : [];
+      if (!paras.length || !pics.length) return res.json({ questions: [] });
+
+      const picList = pics.map((p, i) =>
+        `${i}: ${p.subjects || '?'} — ${p.description || ''}${p.silhouette ? ' [silhouette]' : ''}${p.fullGroup ? ' [whole group]' : ''} (${p.people} people, ${p.vertical ? 'vertical' : 'horizontal'})`
+      ).join('\n');
+      const paraList = paras.map((t, i) => `${i}: ${t}`).join('\n\n');
+
+      const prompt =
+`A blog post is being laid out. Below are the paragraphs that were written, and a list of the photos with what is in each one.
+
+PARAGRAPHS:
+${paraList.slice(0, 6000)}
+
+PHOTOS:
+${picList.slice(0, 6000)}
+
+Find the places where the writing points at a SPECIFIC photo — a favourite shot, a funny moment, something that happened ("when he grabbed her nose", "my favourite frame of the day", "right as the sun dropped"). For each one, we want to place that photo next to those words.
+
+Return ONLY JSON, no fences:
+{"questions":[{"paragraph":0,"quote":"the exact words from the paragraph, copied verbatim","ask":"a short friendly question for the person laying out the post","candidates":[2,5,7]}]}
+
+Rules:
+- "quote" MUST be copied word for word from the paragraph it belongs to.
+- "candidates" are photo numbers from the list above that plausibly match, best first, at most 5.
+- Only include a moment if the words really do point at one particular photo. If the writing is general, return an empty list.
+- At most 4 questions. Prefer the clearest ones.`;
+
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 2000, messages: [{ role: 'user', content: prompt }] }),
+      });
+      const body = await r.json();
+      if (!r.ok) {
+        console.error(base, 'moments anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
+        return res.status(502).json({ error: 'AI request failed' });
+      }
+      let out = (body.content || []).map(c => c.text || '').join('');
+      out = out.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
+      const a = out.indexOf('{'), b = out.lastIndexOf('}');
+      let parsed;
+      try { parsed = JSON.parse(out.slice(a, b + 1)); }
+      catch (e) {
+        console.error(base, 'moments parse failed:', e.message);
+        return res.json({ questions: [] });
+      }
+      res.json({ questions: parsed.questions || [] });
+    } catch (err) {
+      console.error(base, 'moments failed:', err.message);
+      res.status(500).json({ error: 'moment matching failed' });
+    }
+  });
 }
 
 /* ------------------------------------------------- Amy Gray Photography ---- */
@@ -482,135 +611,6 @@ For EACH of the ${count} photos, in order, write:
 Return ONLY JSON, no markdown fences:
 {"altTexts":["...", ...], "imageFilenames":["...", ...]}
 Both arrays must have exactly ${count} entries, in the same order as the photos.`,
-});
-
-/* Look at a batch of photos and report what's in them, so the layout can follow
-   Amy's rules (most people first, silhouettes last, full-family shots alone). */
-app.post('/api/blog/analyze', requireBlogKey, async (req, res) => {
-  try {
-    if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
-    const { thumbs } = req.body || {};
-    const list = Array.isArray(thumbs) ? thumbs.slice(0, 8) : [];
-    if (!list.length) return res.json({ photos: [] });
-
-    const content = [];
-    list.forEach((t, i) => {
-      content.push({ type: 'text', text: `Photo ${i + 1}:` });
-      content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: t.dataBase64 } });
-    });
-    content.push({
-      type: 'text',
-      text:
-`Look carefully at each of these ${list.length} photos from a family portrait session and report what is in them.
-
-For EACH photo, in order, return an object with:
-"people": how many people are visible (a number; 0 if none)
-"fullGroup": true only if this looks like the WHOLE group together — everyone in the session in one frame, posed or walking together. A photo of just one or two members of a larger family is false.
-"silhouette": true if the subjects are backlit and read as dark shapes against a bright sky or water — a true silhouette, not merely a moody or backlit photo
-"closeup": true if it is a tight portrait or detail (hands, feet, rings, face fills the frame)
-"candid": true if it is an unposed moment — laughing, running, playing, mid-motion
-"subjects": very short phrase for who is in it, e.g. "whole family", "mom and baby", "the two brothers", "little girl alone"
-"description": one short sentence describing what is happening
-
-Return ONLY JSON, no markdown fences:
-{"photos":[{"people":0,"fullGroup":false,"silhouette":false,"closeup":false,"candid":false,"subjects":"","description":""}]}
-The array must have exactly ${list.length} entries, in the same order as the photos.`,
-    });
-
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 3000, messages: [{ role: 'user', content }] }),
-    });
-    const body = await r.json();
-    if (!r.ok) {
-      console.error('analyze anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
-      return res.status(502).json({ error: 'AI request failed' });
-    }
-    let out = (body.content || []).map(c => c.text || '').join('');
-    out = out.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
-    const a = out.indexOf('{'), b = out.lastIndexOf('}');
-    let parsed;
-    try { parsed = JSON.parse(out.slice(a, b + 1)); }
-    catch (e) {
-      console.error('analyze parse failed:', e.message, 'stop_reason=', body.stop_reason);
-      return res.status(502).json({ error: 'the AI reply was cut short — try again' });
-    }
-    res.json({ photos: parsed.photos || [] });
-  } catch (err) {
-    console.error('analyze failed:', err.message);
-    res.status(500).json({ error: 'photo analysis failed' });
-  }
-});
-
-/* Read the post text against what we now know about each photo, and work out
-   which photos the words are actually referring to ("our favourite shot",
-   "the moment he lost it laughing"). Text only — no images — so it's quick. */
-app.post('/api/blog/moments', requireBlogKey, async (req, res) => {
-  try {
-    if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
-    const { paragraphs, photos } = req.body || {};
-    const paras = Array.isArray(paragraphs) ? paragraphs : [];
-    const pics = Array.isArray(photos) ? photos : [];
-    if (!paras.length || !pics.length) return res.json({ questions: [] });
-
-    const picList = pics.map((p, i) =>
-      `${i}: ${p.subjects || '?'} — ${p.description || ''}${p.silhouette ? ' [silhouette]' : ''}${p.fullGroup ? ' [whole group]' : ''} (${p.people} people, ${p.vertical ? 'vertical' : 'horizontal'})`
-    ).join('\n');
-    const paraList = paras.map((t, i) => `${i}: ${t}`).join('\n\n');
-
-    const prompt =
-`A blog post about a family photo session is being laid out. Below are the paragraphs Amy wrote, and a list of the photos with what is in each one.
-
-PARAGRAPHS:
-${paraList.slice(0, 6000)}
-
-PHOTOS:
-${picList.slice(0, 6000)}
-
-Find the places where the writing points at a SPECIFIC photo — a favourite shot, a funny moment, something that happened ("when he grabbed her nose", "my favourite frame of the day", "right as the sun dropped"). For each one, we want to place that photo next to those words.
-
-Return ONLY JSON, no fences:
-{"questions":[{"paragraph":0,"quote":"the exact words from the paragraph, copied verbatim","ask":"a short friendly question for the person laying out the post, e.g. Which photo is the moment he grabbed her nose?","candidates":[2,5,7]}]}
-
-Rules:
-- "quote" MUST be copied word for word from the paragraph it belongs to.
-- "candidates" are photo numbers from the list above that plausibly match, best first, at most 5. Include candidates even when you are fairly confident.
-- Only include a moment if the words really do point at one particular photo. If the writing is general, return an empty list.
-- At most 4 questions. Prefer the clearest ones.`;
-
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 2000, messages: [{ role: 'user', content: prompt }] }),
-    });
-    const body = await r.json();
-    if (!r.ok) {
-      console.error('moments anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
-      return res.status(502).json({ error: 'AI request failed' });
-    }
-    let out = (body.content || []).map(c => c.text || '').join('');
-    out = out.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
-    const a = out.indexOf('{'), b = out.lastIndexOf('}');
-    let parsed;
-    try { parsed = JSON.parse(out.slice(a, b + 1)); }
-    catch (e) {
-      console.error('moments parse failed:', e.message);
-      return res.json({ questions: [] });
-    }
-    res.json({ questions: parsed.questions || [] });
-  } catch (err) {
-    console.error('moments failed:', err.message);
-    res.status(500).json({ error: 'moment matching failed' });
-  }
 });
 
 const port = process.env.PORT || 8080;
