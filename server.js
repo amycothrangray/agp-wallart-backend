@@ -276,7 +276,9 @@ Return ONLY a JSON object, no markdown fences, with keys:
       },
       body: JSON.stringify({
         model: 'claude-sonnet-5',
-        max_tokens: 2000,
+        // Roomy: a 20-photo post needs alt text + filenames + links for each.
+        // Too low and the JSON comes back truncated and unparseable.
+        max_tokens: 8000,
         messages: [{ role: 'user', content }],
       }),
     });
@@ -285,11 +287,21 @@ Return ONLY a JSON object, no markdown fences, with keys:
       console.error('anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
       return res.status(502).json({ error: 'AI request failed' });
     }
+    if (body.stop_reason === 'max_tokens') {
+      console.error('anthropic response hit max_tokens — reply was truncated');
+    }
     let textOut = (body.content || []).map(c => c.text || '').join('');
     textOut = textOut.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
     const first = textOut.indexOf('{');
     const last = textOut.lastIndexOf('}');
-    const parsed = JSON.parse(textOut.slice(first, last + 1));
+    let parsed;
+    try {
+      parsed = JSON.parse(textOut.slice(first, last + 1));
+    } catch (parseErr) {
+      console.error('suggest JSON parse failed (%s), stop_reason=%s, chars=%d',
+        parseErr.message, body.stop_reason, textOut.length);
+      return res.status(502).json({ error: 'the AI reply was cut short — try again' });
+    }
     res.json(parsed);
   } catch (err) {
     console.error('suggest failed:', err.message);
