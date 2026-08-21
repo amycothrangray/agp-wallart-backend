@@ -14,8 +14,8 @@ app.use(express.json({ limit: '30mb' }));
 const ORIGIN = process.env.ALLOW_ORIGIN || 'https://amycothrangray.github.io';
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', ORIGIN);
-  res.set('Access-Control-Allow-Headers', 'Content-Type');
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, X-AGP-Key');
+  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -63,6 +63,221 @@ app.post('/api/submit', async (req, res) => {
   } catch (err) {
     console.error('submit failed:', err.message);
     res.status(500).json({ error: 'send failed' });
+  }
+});
+
+/* ---------------------------------------------------------------------------
+   AGP Blog Builder routes — used by https://amycothrangray.github.io/agp-blog-builder/
+   Additional environment variables:
+     BLOG_APP_KEY      — shared passphrase Hannah enters once in the app (SECRET)
+     WP_URL            — https://amygrayphotography.com
+     WP_USER           — WordPress username the Application Password belongs to
+     WP_APP_PASSWORD   — WordPress Application Password (SECRET)
+     ANTHROPIC_API_KEY — for AI suggestions (SECRET)
+--------------------------------------------------------------------------- */
+
+const WP_URL = (process.env.WP_URL || 'https://amygrayphotography.com').replace(/\/$/, '');
+const wpAuth = () => 'Basic ' + Buffer.from(
+  `${process.env.WP_USER}:${process.env.WP_APP_PASSWORD}`).toString('base64');
+
+function requireBlogKey(req, res, next) {
+  if (!process.env.BLOG_APP_KEY) return res.status(503).json({ error: 'blog routes not configured' });
+  if (req.get('x-agp-key') !== process.env.BLOG_APP_KEY) {
+    return res.status(401).json({ error: 'wrong passphrase' });
+  }
+  next();
+}
+
+async function wpFetch(path, opts = {}) {
+  const r = await fetch(WP_URL + path, {
+    ...opts,
+    headers: { Authorization: wpAuth(), ...(opts.headers || {}) },
+  });
+  const text = await r.text();
+  let body;
+  try { body = JSON.parse(text); } catch { body = text; }
+  return { status: r.status, ok: r.ok, body };
+}
+
+/* Site data for the link picker & category dropdown (cached 10 min). */
+let siteCache = { at: 0, data: null };
+app.get('/api/blog/site', requireBlogKey, async (req, res) => {
+  try {
+    if (siteCache.data && Date.now() - siteCache.at < 10 * 60 * 1000) {
+      return res.json(siteCache.data);
+    }
+    const [cats, posts, pages] = await Promise.all([
+      wpFetch('/wp-json/wp/v2/categories?per_page=100&orderby=count&order=desc&_fields=id,name,count'),
+      wpFetch('/wp-json/wp/v2/posts?per_page=60&_fields=id,title,link,date'),
+      wpFetch('/wp-json/wp/v2/pages?per_page=60&_fields=id,title,link'),
+    ]);
+    const data = {
+      categories: (cats.body || []).map(c => ({ id: c.id, name: c.name, count: c.count })),
+      posts: (posts.body || []).map(p => ({ title: p.title?.rendered || '', url: p.link, date: p.date })),
+      pages: (pages.body || []).map(p => ({ title: p.title?.rendered || '', url: p.link })),
+    };
+    siteCache = { at: Date.now(), data };
+    res.json(data);
+  } catch (err) {
+    console.error('site fetch failed:', err.message);
+    res.status(502).json({ error: 'could not reach the website' });
+  }
+});
+
+/* Upload one resized photo to the WordPress media library. */
+app.post('/api/blog/media', requireBlogKey, async (req, res) => {
+  try {
+    const { filename, dataBase64, alt, title } = req.body || {};
+    if (!filename || !dataBase64) return res.status(400).json({ error: 'missing file' });
+    const buf = Buffer.from(dataBase64, 'base64');
+    if (buf.length > 12_000_000) return res.status(413).json({ error: 'image too large' });
+    const safe = String(filename).replace(/[^\w.-]/g, '-').toLowerCase();
+    const up = await wpFetch('/wp-json/wp/v2/media', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'image/jpeg',
+        'Content-Disposition': `attachment; filename="${safe}"`,
+      },
+      body: buf,
+    });
+    if (!up.ok) {
+      console.error('media upload failed:', up.status, JSON.stringify(up.body).slice(0, 300));
+      return res.status(502).json({ error: 'WordPress rejected the upload' });
+    }
+    const id = up.body.id;
+    if (alt || title) {
+      await wpFetch(`/wp-json/wp/v2/media/${id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ alt_text: alt || '', title: title || safe }),
+      });
+    }
+    res.json({ id, url: up.body.source_url });
+  } catch (err) {
+    console.error('media failed:', err.message);
+    res.status(500).json({ error: 'upload failed' });
+  }
+});
+
+/* Create the post itself. Tries to set Yoast fields; falls back gracefully
+   if the site doesn't have the tiny agp-blog-meta plugin installed. */
+app.post('/api/blog/publish', requireBlogKey, async (req, res) => {
+  try {
+    const { title, slug, contentHtml, excerpt, categories, featuredMediaId,
+            status, metaDesc, focusKeyword } = req.body || {};
+    if (!title || !contentHtml) return res.status(400).json({ error: 'missing title or content' });
+    const base = {
+      title, slug: slug || undefined, content: contentHtml,
+      excerpt: excerpt || metaDesc || '',
+      categories: Array.isArray(categories) ? categories : [],
+      featured_media: featuredMediaId || undefined,
+      status: status === 'draft' ? 'draft' : 'publish',
+    };
+    const meta = {};
+    if (metaDesc) meta._yoast_wpseo_metadesc = metaDesc;
+    if (focusKeyword) meta._yoast_wpseo_focuskw = focusKeyword;
+    let r = await wpFetch('/wp-json/wp/v2/posts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.keys(meta).length ? { ...base, meta } : base),
+    });
+    let yoastMetaApplied = Object.keys(meta).length > 0;
+    if (!r.ok && Object.keys(meta).length) {
+      yoastMetaApplied = false;
+      r = await wpFetch('/wp-json/wp/v2/posts', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(base),
+      });
+    }
+    if (!r.ok) {
+      console.error('publish failed:', r.status, JSON.stringify(r.body).slice(0, 300));
+      return res.status(502).json({ error: 'WordPress rejected the post' });
+    }
+    siteCache = { at: 0, data: null };
+    res.json({ id: r.body.id, link: r.body.link, yoastMetaApplied });
+  } catch (err) {
+    console.error('publish failed:', err.message);
+    res.status(500).json({ error: 'publish failed' });
+  }
+});
+
+/* AI suggestions: titles, meta description, per-photo alt text, link ideas.
+   Thumbnails are sent so the model can actually see the photos. */
+app.post('/api/blog/suggest', requireBlogKey, async (req, res) => {
+  try {
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+    const { title, location, text, thumbs } = req.body || {};
+    let site = siteCache.data;
+    if (!site) {
+      try {
+        const posts = await wpFetch('/wp-json/wp/v2/posts?per_page=40&_fields=title,link');
+        const pages = await wpFetch('/wp-json/wp/v2/pages?per_page=40&_fields=title,link');
+        site = {
+          posts: (posts.body || []).map(p => ({ title: p.title?.rendered, url: p.link })),
+          pages: (pages.body || []).map(p => ({ title: p.title?.rendered, url: p.link })),
+        };
+      } catch { site = { posts: [], pages: [] }; }
+    }
+    const internalList = [...(site.pages || []), ...(site.posts || [])]
+      .map(p => `- ${p.title}: ${p.url}`).join('\n');
+
+    const content = [];
+    (Array.isArray(thumbs) ? thumbs.slice(0, 20) : []).forEach((t, i) => {
+      content.push({ type: 'text', text: `Photo ${i + 1} (${t.filename || 'photo'}):` });
+      content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: t.dataBase64 } });
+    });
+    content.push({
+      type: 'text',
+      text:
+`You are the SEO assistant for Amy Gray Photography, a family/beach photographer in San Diego (amygrayphotography.com). A blog post is being prepared.
+
+Working title: ${title || '(none yet)'}
+Location: ${location || '(unknown)'}
+Post text:
+${(text || '(no text yet)').slice(0, 6000)}
+
+Existing pages and posts on the site (for internal links — use ONLY these URLs):
+${internalList.slice(0, 8000)}
+
+Return ONLY a JSON object, no markdown fences, with keys:
+"titleOptions": 3 SEO title options in Amy's style "Location Type Photos | Emotional Hook" (e.g. "Hotel del Coronado Family Photos | Before the Next Chapter Begins")
+"slug": url slug for the best title
+"metaDescription": max 155 chars, warm, includes location + "family photographer" style keywords
+"excerpt": 1-2 sentence excerpt
+"focusKeyword": short focus keyphrase
+"altTexts": array, one entry per photo in order, each a descriptive alt text (max 12 words) mentioning what is happening and the location — write from the actual photo
+"imageFilenames": array, one per photo, an seo-friendly jpeg filename (kebab-case, include location, no extension)
+"internalLinks": 3-5 items {"title","url","why"} chosen from the list above, most relevant first
+"externalLinks": 2-3 items {"title","url","why"} — official venue/location/tourism pages relevant to this post (well-known URLs only)
+"categoryHints": array of likely category names`,
+    });
+
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content }],
+      }),
+    });
+    const body = await r.json();
+    if (!r.ok) {
+      console.error('anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
+      return res.status(502).json({ error: 'AI request failed' });
+    }
+    let textOut = (body.content || []).map(c => c.text || '').join('');
+    textOut = textOut.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
+    const first = textOut.indexOf('{');
+    const last = textOut.lastIndexOf('}');
+    const parsed = JSON.parse(textOut.slice(first, last + 1));
+    res.json(parsed);
+  } catch (err) {
+    console.error('suggest failed:', err.message);
+    res.status(500).json({ error: 'suggestions failed' });
   }
 });
 
