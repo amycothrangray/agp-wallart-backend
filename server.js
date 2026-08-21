@@ -84,8 +84,10 @@ app.post('/api/submit', async (req, res) => {
    Environment variables — Christian Unified:
      CU_BLOG_APP_KEY   — passphrase for the school's app (SECRET)
      CU_WP_URL         — https://christianunified.org (this is the default)
-     CU_WP_USER        — WordPress username on christianunified.org
-     CU_WP_APP_PASSWORD— WordPress Application Password for that user (SECRET)
+     CU_BRIDGE_SECRET  — shared secret shown by the cu-blog-bridge plugin at
+                         Settings -> CU Blog Bridge (SECRET). Used instead of an
+                         application password: Wordfence disables those on that
+                         site, so the plugin exposes its own guarded routes.
 
    Shared:
      ANTHROPIC_API_KEY — for AI suggestions (SECRET)
@@ -106,10 +108,32 @@ function mountBlogRoutes(app, cfg) {
     next();
   }
 
+  /* Two ways to talk to a WordPress site:
+       - stock wp/v2 REST + an application password (Amy Gray Photography), or
+       - the cu-blog-bridge plugin + a shared secret (Christian Unified, where
+         Wordfence disables application passwords site-wide).
+     Reads are the same either way: categories, posts and pages are public, so
+     a bridge site needs no WordPress login at all. */
+  const useBridge = !!cfg.bridge;
+
   async function wpFetch(path, opts = {}) {
-    const r = await fetch(wpUrl() + path, {
-      ...opts,
-      headers: { Authorization: wpAuth(), ...(opts.headers || {}) },
+    const headers = { ...(opts.headers || {}) };
+    if (!useBridge) headers.Authorization = wpAuth();
+    const r = await fetch(wpUrl() + path, { ...opts, headers });
+    const text = await r.text();
+    let body;
+    try { body = JSON.parse(text); } catch { body = text; }
+    return { status: r.status, ok: r.ok, body };
+  }
+
+  async function bridgeFetch(path, payload) {
+    const r = await fetch(wpUrl() + '/wp-json/cu-blog/v1' + path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CU-Bridge-Secret': process.env[cfg.bridge.secretEnv] || '',
+      },
+      body: JSON.stringify(payload),
     });
     const text = await r.text();
     let body;
@@ -164,6 +188,20 @@ function mountBlogRoutes(app, cfg) {
       const buf = Buffer.from(dataBase64, 'base64');
       if (buf.length > 12_000_000) return res.status(413).json({ error: 'image too large' });
       const safe = String(filename).replace(/[^\w.-]/g, '-').toLowerCase();
+
+      if (useBridge) {
+        const b = await bridgeFetch('/media', {
+          filename: safe, dataBase64,
+          alt: alt || '', title: title || safe,
+          caption: caption || '', description: description || '',
+        });
+        if (!b.ok) {
+          console.error(base, 'bridge media failed:', b.status, JSON.stringify(b.body).slice(0, 300));
+          return res.status(502).json({ error: 'WordPress rejected the upload' });
+        }
+        return res.json({ id: b.body.id, url: b.body.url });
+      }
+
       const up = await wpFetch('/wp-json/wp/v2/media', {
         method: 'POST',
         headers: {
@@ -203,6 +241,26 @@ function mountBlogRoutes(app, cfg) {
       const { title, slug, contentHtml, excerpt, categories, featuredMediaId,
               status, metaDesc, focusKeyword } = req.body || {};
       if (!title || !contentHtml) return res.status(400).json({ error: 'missing title or content' });
+      if (useBridge) {
+        const b = await bridgeFetch('/publish', {
+          title, slug: slug || '', contentHtml,
+          excerpt: excerpt || metaDesc || '',
+          categories: Array.isArray(categories) ? categories : [],
+          featuredMediaId: featuredMediaId || 0,
+          status: status === 'draft' ? 'draft' : 'publish',
+          metaDesc: metaDesc || '', focusKeyword: focusKeyword || '',
+        });
+        if (!b.ok) {
+          console.error(base, 'bridge publish failed:', b.status, JSON.stringify(b.body).slice(0, 300));
+          return res.status(502).json({ error: 'WordPress rejected the post' });
+        }
+        siteCache = { at: 0, data: null };
+        return res.json({
+          id: b.body.id, link: b.body.link,
+          yoastMetaApplied: !!b.body.yoastMetaApplied,
+        });
+      }
+
       const post = {
         title, slug: slug || undefined, content: contentHtml,
         excerpt: excerpt || metaDesc || '',
@@ -560,7 +618,8 @@ mountBlogRoutes(app, {
   header: 'x-cu-key',
   defaultUrl: 'https://christianunified.org',
   defaultKeyword: 'Christian school San Diego',
-  env: { key: 'CU_BLOG_APP_KEY', url: 'CU_WP_URL', user: 'CU_WP_USER', pass: 'CU_WP_APP_PASSWORD' },
+  env: { key: 'CU_BLOG_APP_KEY', url: 'CU_WP_URL' },
+  bridge: { secretEnv: 'CU_BRIDGE_SECRET' },
   suggestPrompt: ({ title, location, text, internalList, keywords }) =>
 `You are the SEO assistant for Christian Unified Schools of San Diego (christianunified.org), a private Christian school district in El Cajon and Chula Vista, California. Its campuses are Christian High School, Christian Junior High, Christian Elementary East and West, and Christian South in Chula Vista. The mascot is the Patriots. A blog post about school life is being prepared — an event, a performance, a game, a chapel, a celebration.
 
