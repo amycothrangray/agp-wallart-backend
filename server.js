@@ -106,15 +106,21 @@ app.get('/api/blog/site', requireBlogKey, async (req, res) => {
     if (siteCache.data && Date.now() - siteCache.at < 10 * 60 * 1000) {
       return res.json(siteCache.data);
     }
-    const [cats, posts, pages] = await Promise.all([
+    const [cats, posts, pages, root] = await Promise.all([
       wpFetch('/wp-json/wp/v2/categories?per_page=100&orderby=count&order=desc&_fields=id,name,count'),
       wpFetch('/wp-json/wp/v2/posts?per_page=60&_fields=id,title,link,date'),
       wpFetch('/wp-json/wp/v2/pages?per_page=60&_fields=id,title,link'),
+      wpFetch('/wp-json/'),
     ]);
     const data = {
       categories: (cats.body || []).map(c => ({ id: c.id, name: c.name, count: c.count })),
       posts: (posts.body || []).map(p => ({ title: p.title?.rendered || '', url: p.link, date: p.date })),
       pages: (pages.body || []).map(p => ({ title: p.title?.rendered || '', url: p.link })),
+      timezone: (root.body && root.body.timezone_string) || 'America/Los_Angeles',
+      // Post dates are sent as plain local times and interpreted in this zone.
+      siteTimeNow: new Date().toLocaleString('sv-SE', {
+        timeZone: (root.body && root.body.timezone_string) || 'America/Los_Angeles',
+      }).replace(' ', 'T'),
     };
     siteCache = { at: Date.now(), data };
     res.json(data);
@@ -169,14 +175,24 @@ app.post('/api/blog/media', requireBlogKey, async (req, res) => {
 app.post('/api/blog/publish', requireBlogKey, async (req, res) => {
   try {
     const { title, slug, contentHtml, excerpt, categories, featuredMediaId,
-            status, metaDesc, focusKeyword } = req.body || {};
+            status, metaDesc, focusKeyword, date } = req.body || {};
     if (!title || !contentHtml) return res.status(400).json({ error: 'missing title or content' });
+    // `date` is a plain local datetime ("2026-09-01T09:00:00") and WordPress
+    // reads it in the site's own timezone, which is what the app promises.
+    const cleanDate = typeof date === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(date)
+      ? date.slice(0, 19).padEnd(19, ':00') : null;
+    const allowed = ['publish', 'future', 'draft'];
+    let wpStatus = allowed.includes(status) ? status : 'publish';
+    if (wpStatus === 'future' && !cleanDate) {
+      return res.status(400).json({ error: 'scheduling needs a date' });
+    }
     const base = {
       title, slug: slug || undefined, content: contentHtml,
       excerpt: excerpt || metaDesc || '',
       categories: Array.isArray(categories) ? categories : [],
       featured_media: featuredMediaId || undefined,
-      status: status === 'draft' ? 'draft' : 'publish',
+      status: wpStatus,
+      ...(cleanDate ? { date: cleanDate } : {}),
     };
     const meta = {};
     if (metaDesc) meta._yoast_wpseo_metadesc = metaDesc;
@@ -198,7 +214,10 @@ app.post('/api/blog/publish', requireBlogKey, async (req, res) => {
       return res.status(502).json({ error: 'WordPress rejected the post' });
     }
     siteCache = { at: 0, data: null };
-    res.json({ id: r.body.id, link: r.body.link, yoastMetaApplied });
+    res.json({
+      id: r.body.id, link: r.body.link, yoastMetaApplied,
+      status: r.body.status, date: r.body.date,
+    });
   } catch (err) {
     console.error('publish failed:', err.message);
     res.status(500).json({ error: 'publish failed' });
