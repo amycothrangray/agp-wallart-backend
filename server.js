@@ -335,14 +335,17 @@ function mountBlogRoutes(app, cfg) {
         content.push({ type: 'text', text: `Photo ${i + 1} (${t.filename || 'photo'}):` });
         content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: t.dataBase64 } });
       });
-      content.push({
-        type: 'text',
-        text: cfg.suggestPrompt({
-          title, location, text,
-          internalList,
-          keywords: (Array.isArray(keywords) && keywords.length ? keywords : [cfg.defaultKeyword]).join(', '),
-        }),
+      const { facts } = req.body || {};
+      let promptText = cfg.suggestPrompt({
+        title, location, text,
+        internalList,
+        keywords: (Array.isArray(keywords) && keywords.length ? keywords : [cfg.defaultKeyword]).join(', '),
       });
+      if (facts && typeof facts === 'object' && Object.keys(facts).length) {
+        promptText +=
+`\n\nFacts already extracted from the event's own source documents (flyer, program, press release). Treat these as authoritative for names, dates and places:\n${JSON.stringify(facts).slice(0, 3000)}`;
+      }
+      content.push({ type: 'text', text: promptText });
 
       const r = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -383,6 +386,74 @@ function mountBlogRoutes(app, cfg) {
     } catch (err) {
       console.error(base, 'suggest failed:', err.message);
       res.status(500).json({ error: 'suggestions failed' });
+    }
+  });
+
+  /* Draft the opening paragraph from source material — a flyer, program, press
+     release or email, as PDF or images. Separate from the post photos: this is
+     the who/what/when/where/why the writer would otherwise have to type. */
+  app.post(base + '/intro', requireKey, async (req, res) => {
+    try {
+      if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+      const { docs, title, location, text, keywords } = req.body || {};
+      const list = Array.isArray(docs) ? docs.slice(0, 6) : [];
+      if (!list.length) return res.status(400).json({ error: 'no source documents' });
+      const allowed = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp']);
+      let bytes = 0;
+      const content = [];
+      for (const [i, d] of list.entries()) {
+        if (!d || !allowed.has(d.mediaType) || !d.dataBase64) continue;
+        bytes += d.dataBase64.length * 0.75;
+        content.push({ type: 'text', text: `Source document ${i + 1} (${d.name || d.mediaType}):` });
+        if (d.mediaType === 'application/pdf') {
+          content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: d.dataBase64 } });
+        } else {
+          content.push({ type: 'image', source: { type: 'base64', media_type: d.mediaType, data: d.dataBase64 } });
+        }
+      }
+      if (!content.length) return res.status(400).json({ error: 'no usable documents' });
+      if (bytes > 24_000_000) return res.status(413).json({ error: 'source documents too large — keep it under ~20 MB total' });
+      content.push({
+        type: 'text',
+        text: cfg.introPrompt({
+          title, location,
+          text: (text || '').slice(0, 4000),
+          keywords: (Array.isArray(keywords) && keywords.length ? keywords : [cfg.defaultKeyword]).join(', '),
+        }),
+      });
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 3000, messages: [{ role: 'user', content }] }),
+      });
+      const body = await r.json();
+      if (!r.ok) {
+        console.error(base, 'intro anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
+        return res.status(502).json({ error: 'AI request failed' });
+      }
+      let out = (body.content || []).map(c => c.text || '').join('');
+      out = out.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
+      const a = out.indexOf('{'), b = out.lastIndexOf('}');
+      let parsed;
+      try { parsed = JSON.parse(out.slice(a, b + 1)); }
+      catch (e) {
+        console.error(base, 'intro parse failed:', e.message, 'stop_reason=', body.stop_reason);
+        return res.status(502).json({ error: 'the AI reply was cut short — try again' });
+      }
+      res.json({
+        intro: String(parsed.intro || '').trim(),
+        facts: parsed.facts && typeof parsed.facts === 'object' ? parsed.facts : {},
+        suggestedTitle: parsed.suggestedTitle || '',
+        suggestedLocation: parsed.suggestedLocation || '',
+        unsure: Array.isArray(parsed.unsure) ? parsed.unsure : [],
+      });
+    } catch (err) {
+      console.error(base, 'intro failed:', err.message);
+      res.status(500).json({ error: 'intro failed' });
     }
   });
 
@@ -612,6 +683,20 @@ Return ONLY a JSON object, no markdown fences, with keys:
 "internalLinks": 2-4 items {"title","url","why"} for the "keep exploring" list at the end (do not duplicate inlineLinks)
 "externalLinks": 1-2 items {"title","url","why"} — official venue/location pages, for the end list
 "categoryHints": array of likely category names`,
+  introPrompt: ({ title, location, text, keywords }) =>
+`You are writing for Amy Gray Photography, a family/beach photographer in San Diego (amygrayphotography.com). The documents above are source material for a blog post — typically a client questionnaire, an email, or notes about the session.
+
+Working title: ${title || '(none yet)'}
+Location: ${location || '(unknown)'}
+Any words already written for the post:
+${text || '(none yet)'}
+Keywords Amy is trying to rank for (use one only where it fits naturally): ${keywords}
+
+Write the OPENING paragraph of the blog post — 3 to 5 sentences, warm and first-person in Amy's voice, covering who the family is, where and when the session happened, and what made it special. Use only facts that appear in the documents; never invent names, dates or places. If something important is missing, leave it out rather than guess.
+
+Return ONLY a JSON object, no markdown fences:
+{"intro": "...", "facts": {"who": "...", "what": "...", "when": "...", "where": "...", "why": "...", "how": "..."}, "suggestedTitle": "...", "suggestedLocation": "...", "unsure": ["anything you could not read or were not sure about"]}
+Leave a facts field as an empty string if the documents do not say.`,
   altPrompt: ({ title, location, keywords, count }) =>
 `These are photos from a blog post for Amy Gray Photography, a San Diego family photographer.
 
@@ -673,6 +758,20 @@ Return ONLY a JSON object, no markdown fences, with keys:
 "internalLinks": 2-4 items {"title","url","why"} for the "keep exploring" list at the end (do not duplicate inlineLinks). Favour pages a prospective parent would want next: tours, admissions, the relevant campus, athletics or arts.
 "externalLinks": 1-2 items {"title","url","why"} — official pages for places or organisations named in the post, for the end list
 "categoryHints": array of likely category names, chosen from the site's real categories (e.g. Blog, Chapel, Arts, Athletics)`,
+  introPrompt: ({ title, location, text, keywords }) =>
+`You are writing for Christian Unified Schools of San Diego (christianunified.org), a private Christian school district in El Cajon and Chula Vista, California — campuses are Christian High School, Christian Junior High, Christian Elementary East and West, and Christian South; the mascot is the Patriots. The documents above are source material for a blog post about a school event: a flyer, a program, a press release, an email, or notes.
+
+Working title: ${title || '(none yet)'}
+Campus / place: ${location || '(unknown)'}
+Any words already written for the post:
+${text || '(none yet)'}
+Keywords the school is trying to rank for (use one only where it fits naturally): ${keywords}
+
+Write the OPENING paragraph of the blog post — 3 to 5 sentences, warm, celebratory and community-minded, in the school's voice. Cover the what, when, where, who and why: what the event was, when and where it happened (name the campus), who was involved (grades, teams, groups — never guess an individual's name), and why it mattered. Use only facts that appear in the documents; never invent names, dates, scores or places. If something important is missing, leave it out rather than guess. Plainly Christian where the source is, never preachy.
+
+Return ONLY a JSON object, no markdown fences:
+{"intro": "...", "facts": {"who": "...", "what": "...", "when": "...", "where": "...", "why": "...", "how": "..."}, "suggestedTitle": "an SEO title in the school's style — emotional hook, colon, event and year", "suggestedLocation": "campus or venue as it should appear in the post", "unsure": ["anything you could not read or were not sure about"]}
+Leave a facts field as an empty string if the documents do not say.`,
   altPrompt: ({ title, location, keywords, count }) =>
 `These are photos from a blog post for Christian Unified Schools of San Diego, a private Christian school district in El Cajon and Chula Vista, California. The mascot is the Patriots.
 
