@@ -162,15 +162,23 @@ function mountBlogRoutes(app, cfg) {
       if (siteCache.data && Date.now() - siteCache.at < 10 * 60 * 1000) {
         return res.json(siteCache.data);
       }
-      const [cats, posts, pages] = await Promise.all([
+      const [cats, posts, pages, root] = await Promise.all([
         wpFetch('/wp-json/wp/v2/categories?per_page=100&orderby=count&order=desc&_fields=id,name,count'),
         collect('/wp-json/wp/v2/posts?_fields=id,title,link,date', 1),
         collect('/wp-json/wp/v2/pages?_fields=id,title,link', 4),
+        wpFetch('/wp-json/'),
       ]);
+      // The site's own timezone drives scheduling: the app sends plain local
+      // times and WordPress interprets them in this zone, so what the writer
+      // picks is what readers see. Restored here — it was added for scheduled
+      // posts and then dropped by a later refactor, which broke back-dating.
+      const tz = (root.body && root.body.timezone_string) || cfg.defaultTimezone;
       const data = {
         categories: (cats.body || []).map(c => ({ id: c.id, name: c.name, count: c.count })),
         posts: posts.map(p => ({ title: p.title?.rendered || '', url: p.link, date: p.date })),
         pages: pages.map(p => ({ title: p.title?.rendered || '', url: p.link })),
+        timezone: tz,
+        siteTimeNow: new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T').slice(0, 16),
       };
       siteCache = { at: Date.now(), data };
       res.json(data);
@@ -239,7 +247,7 @@ function mountBlogRoutes(app, cfg) {
   app.post(base + '/publish', requireKey, async (req, res) => {
     try {
       const { title, slug, contentHtml, excerpt, categories, featuredMediaId,
-              status, metaDesc, focusKeyword } = req.body || {};
+              status, metaDesc, focusKeyword, date } = req.body || {};
       if (!title || !contentHtml) return res.status(400).json({ error: 'missing title or content' });
       if (useBridge) {
         const b = await bridgeFetch('/publish', {
@@ -249,6 +257,7 @@ function mountBlogRoutes(app, cfg) {
           featuredMediaId: featuredMediaId || 0,
           status: status === 'draft' ? 'draft' : 'publish',
           metaDesc: metaDesc || '', focusKeyword: focusKeyword || '',
+          date: date || '',
         });
         if (!b.ok) {
           console.error(base, 'bridge publish failed:', b.status, JSON.stringify(b.body).slice(0, 300));
@@ -268,6 +277,12 @@ function mountBlogRoutes(app, cfg) {
         featured_media: featuredMediaId || undefined,
         status: status === 'draft' ? 'draft' : 'publish',
       };
+      if (date) {
+        post.date = date;
+        // WordPress only queues a post when the status says 'future'; without
+        // this a scheduled post goes live at once, dated in the future.
+        if (post.status === 'publish' && new Date(date) > new Date()) post.status = 'future';
+      }
       const meta = {};
       if (metaDesc) meta._yoast_wpseo_metadesc = metaDesc;
       if (focusKeyword) meta._yoast_wpseo_focuskw = focusKeyword;
@@ -563,6 +578,7 @@ mountBlogRoutes(app, {
   base: '/api/blog',
   header: 'x-agp-key',
   defaultUrl: 'https://amygrayphotography.com',
+  defaultTimezone: 'America/Los_Angeles',
   defaultKeyword: 'san diego family photographer',
   env: { key: 'BLOG_APP_KEY', url: 'WP_URL', user: 'WP_USER', pass: 'WP_APP_PASSWORD' },
   suggestPrompt: ({ title, location, text, internalList, keywords }) =>
@@ -617,6 +633,7 @@ mountBlogRoutes(app, {
   base: '/api/cu/blog',
   header: 'x-cu-key',
   defaultUrl: 'https://christianunified.org',
+  defaultTimezone: 'America/Los_Angeles',
   defaultKeyword: 'Christian school San Diego',
   env: { key: 'CU_BLOG_APP_KEY', url: 'CU_WP_URL' },
   bridge: { secretEnv: 'CU_BRIDGE_SECRET' },
