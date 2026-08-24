@@ -93,6 +93,29 @@ app.post('/api/submit', async (req, res) => {
      ANTHROPIC_API_KEY — for AI suggestions (SECRET)
 --------------------------------------------------------------------------- */
 
+
+/* Pages worth linking a blog post to. A photography site accumulates a lot that
+   readers should never be sent to — signed contracts, one-off client pages,
+   half-finished page-builder drafts, account and form plumbing. Each site adds
+   its own patterns via cfg.hidePages. */
+const JUNK_PAGE = new RegExp([
+  'contract', 'flexbox', 'sitemap', 'form-submitted', 'my-account', 'edit-request',
+  'client-proofing', 'checkout', 'cart', 'no-model-release', 'package-customization',
+  'thank-you', 'privacy', 'terms', 'test-page', 'draft',
+].join('|'), 'i');
+
+function linkablePages(pages, cfg) {
+  const extra = cfg.hidePages instanceof RegExp ? cfg.hidePages : null;
+  return pages.filter((p) => {
+    let slug = '';
+    try { slug = new URL(p.url).pathname.replace(/^\/|\/$/g, ''); } catch { slug = ''; }
+    if (!slug) return false;                       // the home page isn't a useful in-post link
+    if (JUNK_PAGE.test(slug) || JUNK_PAGE.test(p.title || '')) return false;
+    if (extra && (extra.test(slug) || extra.test(p.title || ''))) return false;
+    return true;
+  });
+}
+
 function mountBlogRoutes(app, cfg) {
   const base = cfg.base;
   const wpUrl = () => (process.env[cfg.env.url] || cfg.defaultUrl).replace(/\/$/, '');
@@ -176,7 +199,7 @@ function mountBlogRoutes(app, cfg) {
       const data = {
         categories: (cats.body || []).map(c => ({ id: c.id, name: c.name, count: c.count })),
         posts: posts.map(p => ({ title: p.title?.rendered || '', url: p.link, date: p.date })),
-        pages: pages.map(p => ({ title: p.title?.rendered || '', url: p.link })),
+        pages: linkablePages(pages.map(p => ({ title: p.title?.rendered || '', url: p.link })), cfg),
         timezone: tz,
         siteTimeNow: new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T').slice(0, 16),
       };
@@ -721,6 +744,9 @@ Rules:
 mountBlogRoutes(app, {
   base: '/api/blog',
   header: 'x-agp-key',
+  // One-off client pages and old experiments that shouldn't be offered as
+  // links in a blog post. Add a slug here if one starts turning up.
+  hidePages: /^(derm2?|harness|june|foothills|mixed-media-art|shop|presidio-park|coronado-proposal|coronado-avenida-del-sol|venturewell-headshots|session-questionnaire)$/i,
   defaultUrl: 'https://amygrayphotography.com',
   defaultTimezone: 'America/Los_Angeles',
   defaultKeyword: 'san diego family photographer',
