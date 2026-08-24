@@ -52,7 +52,8 @@ app.post('/api/submit', async (req, res) => {
       from: `"Wall Art Mock-Up" <${process.env.SMTP_USER}>`,
       to: process.env.MAIL_TO || 'amy@amygray.net',
       replyTo: `"${safeName}" <${contact.email}>`,
-      subject: `Wall art design — ${safeName}`,
+      subject: (/SEVERE/.test(String(summary || '')) ? '[CHECK PRINT SIZE] ' : '')
+        + `Wall art design — ${safeName}`,
       text: `${summary || ''}\n\nFrom: ${safeName} <${contact.email}>` +
         (contact.phone ? ` · ${contact.phone}` : '') +
         (contact.note ? `\n\nNote from the client:\n${contact.note}` : '') +
