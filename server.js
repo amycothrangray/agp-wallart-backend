@@ -395,9 +395,12 @@ function mountBlogRoutes(app, cfg) {
   app.post(base + '/intro', requireKey, async (req, res) => {
     try {
       if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
-      const { docs, title, location, text, keywords } = req.body || {};
+      const { docs, notes, title, location, text, keywords } = req.body || {};
       const list = Array.isArray(docs) ? docs.slice(0, 6) : [];
-      if (!list.length) return res.status(400).json({ error: 'no source documents' });
+      // Source material can be documents, pasted notes, or both — sometimes
+      // there's no flyer at all, just what someone typed in an email.
+      const raw = typeof notes === 'string' ? notes.trim().slice(0, 12000) : '';
+      if (!list.length && !raw) return res.status(400).json({ error: 'no source material' });
       const allowed = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp']);
       let bytes = 0;
       const content = [];
@@ -411,7 +414,10 @@ function mountBlogRoutes(app, cfg) {
           content.push({ type: 'image', source: { type: 'base64', media_type: d.mediaType, data: d.dataBase64 } });
         }
       }
-      if (!content.length) return res.status(400).json({ error: 'no usable documents' });
+      if (raw) {
+        content.push({ type: 'text', text: `Source notes (pasted in — treat these as the raw facts):\n\n${raw}` });
+      }
+      if (!content.length) return res.status(400).json({ error: 'no usable source material' });
       if (bytes > 24_000_000) return res.status(413).json({ error: 'source documents too large — keep it under ~20 MB total' });
       content.push({
         type: 'text',
