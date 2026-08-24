@@ -392,6 +392,73 @@ function mountBlogRoutes(app, cfg) {
   /* Draft the opening paragraph from source material — a flyer, program, press
      release or email, as PDF or images. Separate from the post photos: this is
      the who/what/when/where/why the writer would otherwise have to type. */
+
+  /* Write the body copy of the post from raw notes — a questionnaire, an email,
+     scribbled details. Separate from /intro, which drafts only an opening. */
+  app.post(base + '/words', requireKey, async (req, res) => {
+    try {
+      if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+      if (!cfg.wordsPrompt) return res.status(501).json({ error: 'not available for this site' });
+      const { notes, docs, title, location, keywords } = req.body || {};
+      const raw = typeof notes === 'string' ? notes.trim().slice(0, 12000) : '';
+      const list = Array.isArray(docs) ? docs.slice(0, 6) : [];
+      if (!raw && !list.length) return res.status(400).json({ error: 'nothing to work from' });
+
+      const allowed = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp']);
+      const content = [];
+      for (const [i, d] of list.entries()) {
+        if (!d || !allowed.has(d.mediaType) || !d.dataBase64) continue;
+        content.push({ type: 'text', text: `Source document ${i + 1} (${d.name || d.mediaType}):` });
+        if (d.mediaType === 'application/pdf') {
+          content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: d.dataBase64 } });
+        } else {
+          content.push({ type: 'image', source: { type: 'base64', media_type: d.mediaType, data: d.dataBase64 } });
+        }
+      }
+      if (raw) content.push({ type: 'text', text: `Notes about the session:\n\n${raw}` });
+      content.push({
+        type: 'text',
+        text: cfg.wordsPrompt({
+          title, location,
+          keywords: (Array.isArray(keywords) && keywords.length ? keywords : [cfg.defaultKeyword]).join(', '),
+        }),
+      });
+
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 2000, messages: [{ role: 'user', content }] }),
+      });
+      const body = await r.json();
+      if (!r.ok) {
+        console.error(base, 'words anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
+        return res.status(502).json({ error: 'AI request failed' });
+      }
+      let out = (body.content || []).map(c => c.text || '').join('');
+      out = out.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
+      const a = out.indexOf('{'), b = out.lastIndexOf('}');
+      let parsed;
+      try { parsed = JSON.parse(out.slice(a, b + 1)); }
+      catch (e) {
+        console.error(base, 'words parse failed:', e.message, 'stop_reason=', body.stop_reason);
+        return res.status(502).json({ error: 'the AI reply was cut short — try again' });
+      }
+      res.json({
+        words: String(parsed.words || '').trim(),
+        suggestedTitle: String(parsed.suggestedTitle || '').trim(),
+        suggestedLocation: String(parsed.suggestedLocation || '').trim(),
+        unsure: Array.isArray(parsed.unsure) ? parsed.unsure : [],
+      });
+    } catch (err) {
+      console.error(base, 'words failed:', err.message);
+      res.status(500).json({ error: 'writing failed' });
+    }
+  });
+
   app.post(base + '/intro', requireKey, async (req, res) => {
     try {
       if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
@@ -689,6 +756,33 @@ Return ONLY a JSON object, no markdown fences, with keys:
 "internalLinks": 2-4 items {"title","url","why"} for the "keep exploring" list at the end (do not duplicate inlineLinks)
 "externalLinks": 1-2 items {"title","url","why"} — official venue/location pages, for the end list
 "categoryHints": array of likely category names`,
+  wordsPrompt: ({ title, location, keywords }) =>
+`Write the blog copy for a session at Amy Gray Photography, a family and beach photographer in San Diego. Everything above — a client questionnaire, an email, or Amy's own notes — is the source material.
+
+Working title: ${title || '(none yet)'}
+Location: ${location || '(unknown)'}
+Keywords Amy would like to rank for, used ONLY where one fits naturally: ${keywords}
+
+Write it in Amy's voice. This matters more than anything else:
+- Conversational and warm, never gushy. Say what happened and let the reader feel it; don't tell them how to feel.
+- Dry humour and parenthetical asides are welcome — "(every family has one)".
+- Specific details beat adjectives. Not "a beautiful evening" — the sand, the wind, what the kids actually did.
+- Vary the sentence length. Some long with dashes and commas, some short. Never choppy all the way through.
+- Let the client's own words carry the weight. Quote the questionnaire directly where it's good; those lines are usually the best part.
+- Never brag about Amy, her skill with kids, or her availability. Never mention session length or pricing.
+- No AI tells. Never "not just X, but Y", "a testament to", "nestled", "tapestry", "journey".
+
+Shape: 3 to 5 short paragraphs, about 250 words total.
+1. How the session came about (a sentence or two)
+2. The family — who they are, their personalities, what made them memorable. This is the longest part.
+3. What they hoped to capture, and/or their favourite photo — in their words where you have them
+4. A short closer — their trip, or a simple closing thought
+
+Use ONLY facts that appear in the source material. Never invent a name, an age, a date or a place. If something is missing, write around it rather than guess, and say so in "unsure".
+Separate paragraphs with a blank line. No headings, no titles inside the copy, no call to action, no HTML.
+
+Return ONLY JSON, no markdown fences:
+{"words": "the paragraphs, separated by blank lines", "suggestedTitle": "Location Type Photos | Emotional Hook", "suggestedLocation": "where the session happened", "unsure": ["anything you had to leave out or guess at"]}`,
   introPrompt: ({ title, location, text, keywords }) =>
 `You are writing for Amy Gray Photography, a family/beach photographer in San Diego (amygrayphotography.com). The documents above are source material for a blog post — typically a client questionnaire, an email, or notes about the session.
 
