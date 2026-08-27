@@ -222,17 +222,14 @@ function mountBlogRoutes(app, cfg) {
       const q = String(req.query.q || '').trim().slice(0, 80);
       if (q.length < 2) return res.json({ results: [] });
       const enc = encodeURIComponent(q);
-      const [posts, pages] = await Promise.all([
-        wpFetch(`/wp-json/wp/v2/posts?search=${enc}&per_page=20&orderby=relevance&_fields=title,link,date`),
-        wpFetch(`/wp-json/wp/v2/pages?search=${enc}&per_page=20&orderby=relevance&_fields=title,link`),
-      ]);
-      const asItems = (body, kind) => (Array.isArray(body) ? body : []).map((p) => ({
-        title: p.title?.rendered || '', url: p.link, date: p.date, kind,
-      }));
-      const results = [
-        ...linkablePages(asItems(pages.body, 'page'), cfg),
-        ...asItems(posts.body, 'post'),
-      ].filter((r) => r.url);
+      // Posts only. Every page is already in the cached /site list and gets
+      // filtered there; asking WordPress for pages as well drags in anything
+      // that merely mentions the word in its body (Pricing, Contact…).
+      const posts = await wpFetch(
+        `/wp-json/wp/v2/posts?search=${enc}&per_page=25&orderby=relevance&_fields=title,link,date`);
+      const results = (Array.isArray(posts.body) ? posts.body : [])
+        .map((p) => ({ title: p.title?.rendered || '', url: p.link, date: p.date, kind: 'post' }))
+        .filter((r) => r.url);
       res.json({ results });
     } catch (err) {
       console.error(base, 'search failed:', err.message);
