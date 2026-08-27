@@ -213,6 +213,33 @@ function mountBlogRoutes(app, cfg) {
   });
 
   /* Upload one resized photo to the WordPress media library. */
+
+  /* Search the whole site for something to link to. The cached /site list only
+     carries the most recent posts — amygrayphotography.com has ~800 — so an
+     older session can only be found by asking WordPress directly. */
+  app.get(base + '/search', requireKey, async (req, res) => {
+    try {
+      const q = String(req.query.q || '').trim().slice(0, 80);
+      if (q.length < 2) return res.json({ results: [] });
+      const enc = encodeURIComponent(q);
+      const [posts, pages] = await Promise.all([
+        wpFetch(`/wp-json/wp/v2/posts?search=${enc}&per_page=20&orderby=relevance&_fields=title,link,date`),
+        wpFetch(`/wp-json/wp/v2/pages?search=${enc}&per_page=20&orderby=relevance&_fields=title,link`),
+      ]);
+      const asItems = (body, kind) => (Array.isArray(body) ? body : []).map((p) => ({
+        title: p.title?.rendered || '', url: p.link, date: p.date, kind,
+      }));
+      const results = [
+        ...linkablePages(asItems(pages.body, 'page'), cfg),
+        ...asItems(posts.body, 'post'),
+      ].filter((r) => r.url);
+      res.json({ results });
+    } catch (err) {
+      console.error(base, 'search failed:', err.message);
+      res.status(502).json({ error: 'search failed' });
+    }
+  });
+
   app.post(base + '/media', requireKey, async (req, res) => {
     try {
       const { filename, dataBase64, alt, title, caption, description } = req.body || {};
