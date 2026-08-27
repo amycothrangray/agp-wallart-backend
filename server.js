@@ -189,7 +189,7 @@ function mountBlogRoutes(app, cfg) {
       const [cats, posts, pages, root] = await Promise.all([
         wpFetch('/wp-json/wp/v2/categories?per_page=100&orderby=count&order=desc&_fields=id,name,count'),
         collect('/wp-json/wp/v2/posts?_fields=id,title,link,date', 1),
-        collect('/wp-json/wp/v2/pages?_fields=id,title,link', 4),
+        collect(`/wp-json/wp/v2/pages?_fields=id,title,link${cfg.dropFormPages ? ',content' : ''}`, 4),
         wpFetch('/wp-json/'),
       ]);
       // The site's own timezone drives scheduling: the app sends plain local
@@ -200,7 +200,16 @@ function mountBlogRoutes(app, cfg) {
       const data = {
         categories: (cats.body || []).map(c => ({ id: c.id, name: c.name, count: c.count })),
         posts: posts.map(p => ({ title: p.title?.rendered || '', url: p.link, date: p.date })),
-        pages: linkablePages(pages.map(p => ({ title: p.title?.rendered || '', url: p.link })), cfg),
+        pages: linkablePages(
+          pages
+            // A school site is mostly forms — permission slips, sign-ups,
+            // absence reports. They're embedded from Cognito Forms, so the
+            // embed in the page body is the reliable way to spot them; the
+            // titles alone don't say ("Use Last Year's Photo" is a form).
+            .filter((p) => !cfg.dropFormPages
+              || !/cognitoforms/i.test(p.content?.rendered || ''))
+            .map(p => ({ title: p.title?.rendered || '', url: p.link })),
+          cfg),
         timezone: tz,
         siteTimeNow: new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T').slice(0, 16),
       };
@@ -368,10 +377,17 @@ function mountBlogRoutes(app, cfg) {
       if (!site) {
         try {
           const posts = await collect('/wp-json/wp/v2/posts?_fields=title,link', 1);
-          const pages = await collect('/wp-json/wp/v2/pages?_fields=title,link', 4);
+          const pages = await collect(
+            `/wp-json/wp/v2/pages?_fields=title,link${cfg.dropFormPages ? ',content' : ''}`, 4);
           site = {
             posts: posts.map(p => ({ title: p.title?.rendered, url: p.link })),
-            pages: pages.map(p => ({ title: p.title?.rendered, url: p.link })),
+            // Same filtering as /site — otherwise the AI happily offers to link
+            // a story about a concert to a detention sign-up form.
+            pages: linkablePages(
+              pages
+                .filter((p) => !cfg.dropFormPages || !/cognitoforms/i.test(p.content?.rendered || ''))
+                .map(p => ({ title: p.title?.rendered, url: p.link })),
+              cfg),
           };
         } catch { site = { posts: [], pages: [] }; }
       }
@@ -867,6 +883,7 @@ Both arrays must have exactly ${count} entries, in the same order as the photos.
 /* --------------------------------- Christian Unified Schools of San Diego --- */
 mountBlogRoutes(app, {
   base: '/api/cu/blog',
+  dropFormPages: true,        // christianunified.org is ~75% Cognito Forms pages
   header: 'x-cu-key',
   defaultUrl: 'https://christianunified.org',
   defaultTimezone: 'America/Los_Angeles',
