@@ -72,6 +72,7 @@ app.post('/api/submit', async (req, res) => {
 
      /api/blog/*     Amy Gray Photography   → https://amycothrangray.github.io/agp-blog-builder/
      /api/cu/blog/*  Christian Unified      → https://amycothrangray.github.io/cu-blog-builder/
+     /api/sw/blog/*  Sitterwise             → https://amycothrangray.github.io/sitterwiseblogbuilder/
 
    Each site brings its own passphrase, WordPress credentials and AI briefing;
    everything else (media upload, publish, alt text) is shared code.
@@ -89,6 +90,17 @@ app.post('/api/submit', async (req, res) => {
                          Settings -> CU Blog Bridge (SECRET). Used instead of an
                          application password: Wordfence disables those on that
                          site, so the plugin exposes its own guarded routes.
+
+   Environment variables — Sitterwise:
+     SW_BLOG_APP_KEY   — passphrase for the Sitterwise app (SECRET)
+     SW_WP_URL         — https://sitterwise.com (this is the default)
+     SW_BRIDGE_SECRET  — shared secret shown by the sitterwise-blog-bridge
+                         plugin at Settings -> Sitterwise Blog Bridge (SECRET).
+                         sitterwise.com runs Elementor, and the bridge is where
+                         the Elementor-specific handling lives: clearing the
+                         builder flag off the post, re-serving the blog CSS from
+                         <head> when kses eats the inline <style>, and printing
+                         the BlogPosting schema in <head>.
 
    Shared:
      ANTHROPIC_API_KEY — for AI suggestions (SECRET)
@@ -150,14 +162,19 @@ function mountBlogRoutes(app, cfg) {
     return { status: r.status, ok: r.ok, body };
   }
 
-  async function bridgeFetch(path, payload) {
-    const r = await fetch(wpUrl() + '/wp-json/cu-blog/v1' + path, {
-      method: 'POST',
+  /* Each bridge plugin owns its own REST namespace and secret header; the
+     defaults are Christian Unified's, which is the site the bridge was written
+     for, so its config keeps working unchanged. */
+  async function bridgeFetch(path, payload, method) {
+    const ns = (cfg.bridge && cfg.bridge.namespace) || 'cu-blog/v1';
+    const hdr = (cfg.bridge && cfg.bridge.header) || 'X-CU-Bridge-Secret';
+    const r = await fetch(wpUrl() + '/wp-json/' + ns + path, {
+      method: method || 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-CU-Bridge-Secret': process.env[cfg.bridge.secretEnv] || '',
+        [hdr]: process.env[cfg.bridge.secretEnv] || '',
       },
-      body: JSON.stringify(payload),
+      ...(method === 'GET' ? {} : { body: JSON.stringify(payload) }),
     });
     const text = await r.text();
     let body;
@@ -186,11 +203,20 @@ function mountBlogRoutes(app, cfg) {
       if (siteCache.data && Date.now() - siteCache.at < 10 * 60 * 1000) {
         return res.json(siteCache.data);
       }
-      const [cats, posts, pages, root] = await Promise.all([
+      /* The bridge plugin knows things the public REST API doesn't: whether
+         Elementor is active, which SEO plugin to write meta into, what sits in
+         front of a post slug in the permalink, which page templates exist, and
+         whether the posting user can save a raw <style> block. All of it has a
+         safe default in the app, so a failed ping is not an error. */
+      const ping = useBridge
+        ? bridgeFetch('/ping', null, 'GET').then((r) => (r.ok ? r.body : null)).catch(() => null)
+        : Promise.resolve(null);
+      const [cats, posts, pages, root, info] = await Promise.all([
         wpFetch('/wp-json/wp/v2/categories?per_page=100&orderby=count&order=desc&_fields=id,name,count'),
         collect('/wp-json/wp/v2/posts?_fields=id,title,link,date', 1),
         collect(`/wp-json/wp/v2/pages?_fields=id,title,link${cfg.dropFormPages ? ',content' : ''}`, 4),
         wpFetch('/wp-json/'),
+        ping,
       ]);
       // The site's own timezone drives scheduling: the app sends plain local
       // times and WordPress interprets them in this zone, so what the writer
@@ -212,6 +238,7 @@ function mountBlogRoutes(app, cfg) {
           cfg),
         timezone: tz,
         siteTimeNow: new Date().toLocaleString('sv-SE', { timeZone: tz }).replace(' ', 'T').slice(0, 16),
+        ...(info ? { info } : {}),
       };
       siteCache = { at: Date.now(), data };
       res.json(data);
@@ -304,7 +331,8 @@ function mountBlogRoutes(app, cfg) {
   app.post(base + '/publish', requireKey, async (req, res) => {
     try {
       const { title, slug, contentHtml, excerpt, categories, featuredMediaId,
-              status, metaDesc, focusKeyword, date } = req.body || {};
+              status, metaDesc, focusKeyword, date,
+              jsonLd, blogCss, pageTemplate, clearElementor } = req.body || {};
       if (!title || !contentHtml) return res.status(400).json({ error: 'missing title or content' });
       if (useBridge) {
         const b = await bridgeFetch('/publish', {
@@ -315,6 +343,10 @@ function mountBlogRoutes(app, cfg) {
           status: status === 'draft' ? 'draft' : 'publish',
           metaDesc: metaDesc || '', focusKeyword: focusKeyword || '',
           date: date || '',
+          // Elementor and head-output extras. A bridge that predates them
+          // ignores unknown keys, so the older CU plugin is unaffected.
+          jsonLd: jsonLd || '', blogCss: blogCss || '',
+          pageTemplate: pageTemplate || '', clearElementor: !!clearElementor,
         });
         if (!b.ok) {
           console.error(base, 'bridge publish failed:', b.status, JSON.stringify(b.body).slice(0, 300));
@@ -323,7 +355,11 @@ function mountBlogRoutes(app, cfg) {
         siteCache = { at: 0, data: null };
         return res.json({
           id: b.body.id, link: b.body.link,
+          status: b.body.status, date: b.body.date,
           yoastMetaApplied: !!b.body.yoastMetaApplied,
+          seoPlugin: b.body.seoPlugin || '',
+          styleMoved: !!b.body.styleMoved,
+          elementorCleared: !!b.body.elementorCleared,
         });
       }
 
@@ -651,6 +687,102 @@ function mountBlogRoutes(app, cfg) {
     }
   });
 
+  /* Write a whole blog post to a fixed brand template. The photo-led sites
+     (Amy Gray Photography, Christian Unified) start from a gallery and paste
+     words in around it; a Sitterwise post is the other way round — a hero, a
+     glance box, a few sections, a tip box and a CTA, all in a shape the brand
+     never varies. So this returns the finished structure as blocks, and the
+     app drops them straight into its editor. Only mounted where a site has a
+     composePrompt. */
+  app.post(base + '/compose', requireKey, async (req, res) => {
+    try {
+      if (!process.env.ANTHROPIC_API_KEY) return res.status(503).json({ error: 'AI not configured' });
+      if (!cfg.composePrompt) return res.status(501).json({ error: 'not available for this site' });
+      const { brief, docs, title, place, kind, kindLabel, angle, keywords, ranked } = req.body || {};
+      const raw = typeof brief === 'string' ? brief.trim().slice(0, 12000) : '';
+      const list = Array.isArray(docs) ? docs.slice(0, 6) : [];
+      if (!raw && !list.length) return res.status(400).json({ error: 'nothing to work from' });
+
+      const allowed = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp']);
+      let bytes = 0;
+      const content = [];
+      for (const [i, d] of list.entries()) {
+        if (!d || !allowed.has(d.mediaType) || !d.dataBase64) continue;
+        bytes += d.dataBase64.length * 0.75;
+        content.push({ type: 'text', text: `Source document ${i + 1} (${d.name || d.mediaType}):` });
+        if (d.mediaType === 'application/pdf') {
+          content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: d.dataBase64 } });
+        } else {
+          content.push({ type: 'image', source: { type: 'base64', media_type: d.mediaType, data: d.dataBase64 } });
+        }
+      }
+      if (bytes > 24_000_000) return res.status(413).json({ error: 'source documents too large — keep it under ~20 MB total' });
+      if (raw) content.push({ type: 'text', text: `The brief:\n\n${raw}` });
+
+      /* Ranks matter to the writing, not just the reporting: a term the site
+         already holds at #1 does not want another post competing with it, and
+         one sitting on page two or three is exactly what a post can move. */
+      const rankLine = Array.isArray(ranked) && ranked.length
+        ? ranked.map((r) => `${r.kw} (currently #${r.rank})`).join('; ')
+        : '';
+      content.push({
+        type: 'text',
+        text: cfg.composePrompt({
+          title, place, kind, kindLabel, angle, rankLine,
+          keywords: (Array.isArray(keywords) && keywords.length ? keywords : [cfg.defaultKeyword]).join(', '),
+        }),
+      });
+
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        // A whole post plus the SEO fields overflows a small budget and comes
+        // back truncated and unparseable.
+        body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 8000, messages: [{ role: 'user', content }] }),
+      });
+      const body = await r.json();
+      if (!r.ok) {
+        console.error(base, 'compose anthropic failed:', r.status, JSON.stringify(body).slice(0, 300));
+        return res.status(502).json({ error: 'AI request failed' });
+      }
+      if (body.stop_reason === 'max_tokens') {
+        console.error(base, 'compose response hit max_tokens — reply was truncated');
+      }
+      let out = (body.content || []).map((c) => c.text || '').join('');
+      out = out.replace(/^```(json)?/m, '').replace(/```\s*$/m, '').trim();
+      const a = out.indexOf('{'), b = out.lastIndexOf('}');
+      let parsed;
+      try { parsed = JSON.parse(out.slice(a, b + 1)); }
+      catch (e) {
+        console.error(base, 'compose parse failed:', e.message, 'stop_reason=', body.stop_reason);
+        return res.status(502).json({ error: 'the AI reply was cut short — try again' });
+      }
+      res.json({
+        eyebrow: String(parsed.eyebrow || '').trim(),
+        heroHeadline: String(parsed.heroHeadline || '').trim(),
+        heroSub: String(parsed.heroSub || '').trim(),
+        heroCaption: String(parsed.heroCaption || '').trim(),
+        title: String(parsed.title || '').trim(),
+        place: String(parsed.place || '').trim(),
+        blocks: Array.isArray(parsed.blocks) ? parsed.blocks : [],
+        cta: parsed.cta && typeof parsed.cta === 'object' ? parsed.cta : null,
+        slug: String(parsed.slug || '').trim(),
+        metaDescription: String(parsed.metaDescription || '').trim(),
+        excerpt: String(parsed.excerpt || '').trim(),
+        focusKeyword: String(parsed.focusKeyword || '').trim(),
+        secondaryKeywords: Array.isArray(parsed.secondaryKeywords) ? parsed.secondaryKeywords : [],
+        unsure: Array.isArray(parsed.unsure) ? parsed.unsure : [],
+      });
+    } catch (err) {
+      console.error(base, 'compose failed:', err.message);
+      res.status(500).json({ error: 'writing the post failed' });
+    }
+  });
+
   /* Look at a batch of photos and report what is in them, so the layout can
      follow the house rules (most people first, silhouettes last, whole-group
      shots on their own). */
@@ -950,6 +1082,165 @@ Keywords the school wants to rank for: ${keywords}
 For EACH of the ${count} photos, in order, write:
 - alt text: describe what is actually happening in that specific photo (who, what, where) in at most 14 words. Every one must be different from the others — never repeat a generic line. Mention the campus or event naturally in some of them. Work a keyword in ONLY where it honestly describes the picture. Never guess a student's or staff member's name — say "a student", "students", "the team", "a teacher".
 - a filename: kebab-case, descriptive, includes the campus or event, no extension.
+
+Return ONLY JSON, no markdown fences:
+{"altTexts":["...", ...], "imageFilenames":["...", ...]}
+Both arrays must have exactly ${count} entries, in the same order as the photos.`,
+});
+
+/* ------------------------------------------------------------- Sitterwise ---
+   sitterwise.com — vetted local caregivers for families travelling in San
+   Diego, and for hotels and events. Unlike the other two sites this one is
+   copy-led: every post follows the same brand template, so /compose returns a
+   finished structure rather than a paragraph. */
+
+/* House rules, repeated into every prompt because they are the difference
+   between a Sitterwise post and a generic one. */
+const SW_VOICE = `Voice — this matters more than anything else:
+- Conversational and warm, never gushy. Say what is true and let it land; do not tell the reader how to feel.
+- Specific details beat adjectives. "The sand actually sparkles" beats "a beautiful beach".
+- Parenthetical asides and light dry humour are welcome.
+- Vary the sentence length. Some long and flowing, some short. Never choppy all the way through.
+- Always say "caregivers", never "sitters", for the people Sitterwise sends. ("Babysitter" is fine and is what parents search for — it is the bare word "sitter" that is off-brand.)
+- No AI tells. Never "not just X, but Y", "nestled", "a testament to", "tapestry", "journey", "hidden gem", "vibrant", "bustling", "delve", "whether you're X or Y".
+- The service tie-in belongs in the tip box and the CTA. The post has to be genuinely useful on its own — do not sell in every paragraph.
+- Never invent a price, an opening time, a distance or a name. If the source does not say, write around it and list it under "unsure".`;
+
+const SW_KEYWORD_RULE = `Keywords Sitterwise is trying to rank for. Work the relevant ones in naturally, never stuff them, and never use one that does not honestly fit this post:
+{{KEYWORDS}}
+
+Current Google positions, from this month's report: {{RANKS}}
+Read those positions as strategy. A term already sitting in the top few is won — support it with an internal link rather than writing a post that competes with it. A term on page two or three is what a post like this can actually move, so prefer one of those as the focus keyword when the subject genuinely fits.`;
+
+const swKeywordBlock = ({ keywords, rankLine }) => SW_KEYWORD_RULE
+  .replace('{{KEYWORDS}}', keywords)
+  .replace('{{RANKS}}', rankLine || '(none supplied)');
+
+mountBlogRoutes(app, {
+  base: '/api/sw/blog',
+  header: 'x-sw-key',
+  defaultUrl: 'https://sitterwise.com',
+  defaultTimezone: 'America/Los_Angeles',
+  defaultKeyword: 'hotel childcare',
+  env: { key: 'SW_BLOG_APP_KEY', url: 'SW_WP_URL' },
+  bridge: {
+    secretEnv: 'SW_BRIDGE_SECRET',
+    namespace: 'sw-blog/v1',
+    header: 'X-SW-Bridge-Secret',
+  },
+  // Account plumbing the booking app owns; nobody wants a blog post linking here.
+  hidePages: /^(login|signup|sign-up|register|account|dashboard|reset-password|apply|application|terms|privacy|cookie)/i,
+
+  composePrompt: ({ title, place, kindLabel, angle, keywords, rankLine }) =>
+`You are writing a blog post for Sitterwise (sitterwise.com), which connects families with experienced, vetted local caregivers in San Diego — at their hotel, their vacation rental, or an event. The readers are parents: mostly visiting families staying in a hotel or rental, plus locals, plus event and conference organisers.
+
+Everything above is the source material — a brief, and possibly a property page, press kit or flyer. Use only what is actually in it.
+
+Post type: ${kindLabel || 'San Diego Family Guide'} — ${angle || 'a guide for families in San Diego'}
+Working title: ${title || '(none yet)'}
+Place or subject: ${place || '(not given)'}
+
+${SW_VOICE}
+
+${swKeywordBlock({ keywords, rankLine })}
+
+Shape — this is a fixed brand template, so follow it exactly:
+- A navy hero: a short uppercase eyebrow, a Playfair headline, and one sentence underneath.
+- A first paragraph or two that sets the scene.
+- A "glance box" near the top: a teal callout with a short label, one lead line, and 3-5 bullets. The day, or the stay, at a glance.
+- Three or four H2 sections with two or three paragraphs each. Sub-headings (H3) only where a section genuinely splits.
+- Two image slots, spaced through the article, each with a short italic caption. Return them as blocks of type "image" with a caption; the photos get added in the app.
+- A "tip box" near the end: a navy callout labelled "Parent Tip". This is the one place the service is woven in — a caregiver at the hotel or rental so the parents get a few hours to themselves. One short paragraph, warm, not a pitch.
+- A closing paragraph after the tip box.
+- A coral CTA strip at the very end.
+
+About 600 words in the body, not counting the hero or the CTA.
+
+Return ONLY a JSON object, no markdown fences:
+{
+  "eyebrow": "short uppercase-style label, e.g. San Diego Family Guide or Hotel Feature",
+  "heroHeadline": "the big headline — short, concrete, no colon-subtitle padding",
+  "heroSub": "one sentence under the headline",
+  "heroCaption": "one short italic caption for the hero photo",
+  "title": "the WordPress post title — can be longer and more searchable than the hero headline",
+  "place": "the place or property this is about, as it should read in the post",
+  "blocks": [
+    {"type":"text","text":"a paragraph"},
+    {"type":"glance","label":"The Quick Version","lead":"one line","items":["bullet","bullet","bullet"]},
+    {"type":"heading","text":"an H2"},
+    {"type":"sub","text":"an H3"},
+    {"type":"list","intro":"optional line","items":["bullet"]},
+    {"type":"image","caption":"short italic caption"},
+    {"type":"tip","label":"Parent Tip","text":"one paragraph"}
+  ],
+  "cta": {"heading":"Playfair heading for the coral strip","text":"one line","button":"Book a Caregiver"},
+  "slug": "url-slug",
+  "metaDescription": "max 155 characters, includes the focus keyword",
+  "excerpt": "1-2 sentences",
+  "focusKeyword": "one phrase from the keyword list that this post can realistically win",
+  "secondaryKeywords": ["2-4 more from the list this post honestly supports"],
+  "unsure": ["anything the source did not say that you left out rather than guess"]
+}
+The blocks array must be in reading order and must contain exactly one "glance" block near the top and exactly one "tip" block near the end.`,
+
+  introPrompt: ({ title, location, text, keywords }) =>
+`You are writing for Sitterwise (sitterwise.com), which connects families with vetted local caregivers in San Diego — at their hotel, vacation rental or event. The documents above are source material for a blog post.
+
+Working title: ${title || '(none yet)'}
+Place or subject: ${location || '(unknown)'}
+Any words already written:
+${text || '(none yet)'}
+Keywords to work in only where one fits naturally: ${keywords}
+
+${SW_VOICE}
+
+Write the OPENING paragraph — 3 to 5 sentences that set the scene: where this is, who it suits, and what the day or the stay is actually like. Use only facts from the documents.
+
+Return ONLY a JSON object, no markdown fences:
+{"intro": "...", "facts": {"who": "...", "what": "...", "when": "...", "where": "...", "why": "...", "how": "..."}, "suggestedTitle": "...", "suggestedLocation": "...", "unsure": ["anything you could not read or were not sure about"]}
+Leave a facts field as an empty string if the documents do not say.`,
+
+  suggestPrompt: ({ title, location, text, internalList, keywords }) =>
+`You are the SEO assistant for Sitterwise (sitterwise.com), which connects families with experienced, vetted local caregivers in San Diego — at their hotel, vacation rental or event. A blog post is being prepared.
+
+Working title: ${title || '(none yet)'}
+Place or subject: ${location || '(unknown)'}
+Post text:
+${(text || '(no text yet)').slice(0, 6000)}
+
+Existing pages and posts on the site (for internal links — use ONLY these URLs):
+${internalList.slice(0, 8000)}
+
+${swKeywordBlock({ keywords, rankLine: '' })}
+
+Note on wording: "babysitter" and "babysitters" are search terms parents really type and are fine in a title or description. The bare word "sitter" is not — Sitterwise's people are always "caregivers".
+
+Return ONLY a JSON object, no markdown fences, with keys:
+"titleOptions": 3 title options. Sitterwise's house style is plain and searchable — the place or property, what the post is for, and who it is for. No colon-subtitle padding, no clickbait.
+"slug": url slug for the best title
+"metaDescription": max 155 chars, warm, names the place and works in the most relevant target keyword
+"excerpt": 1-2 sentence excerpt
+"focusKeyword": short focus keyphrase — pick from the keyword list above, favouring one the site does not already own outright
+"secondaryKeywords": 2-4 more from the list that this post can realistically support
+"inlineLinks": THE MOST IMPORTANT FIELD. Links to weave into the body text itself.
+   3-6 items {"phrase","url","title","kind","why"} where:
+     - "phrase" MUST be a short word-for-word quote (2-6 words) copied EXACTLY from the post text above, including its exact capitalisation. Never invent a phrase that is not in the text. Pick natural anchor text (a place name, an activity, a phrase like "hotel childcare").
+     - "url" is either one of Sitterwise's URLs listed above (kind: "internal") — favour the booking page, hotel childcare, and how-it-works — or the official site of a venue, hotel or attraction actually named in the text (kind: "external"). Only well-known official URLs.
+     - At least one internal and at least one external where the text supports it. Each phrase distinct, each appearing once.
+"internalLinks": 2-4 items {"title","url","why"} for the "Keep exploring" list at the end (do not duplicate inlineLinks). Favour what a parent wants next: booking, hotel childcare, rates, how it works.
+"externalLinks": 1-2 items {"title","url","why"} — official pages for the hotels, parks or attractions named in the post
+"categoryHints": array of likely category names, chosen from the site's real categories`,
+
+  altPrompt: ({ title, location, keywords, count }) =>
+`These are photos from a blog post for Sitterwise, which connects families with vetted local caregivers in San Diego — at their hotel, vacation rental or event.
+
+Post title: ${title || '(untitled)'}
+Place or subject: ${location || '(unknown)'}
+Keywords Sitterwise wants to rank for: ${keywords}
+
+For EACH of the ${count} photos, in order, write:
+- alt text: describe what is actually in that specific photo (who, what, where) in at most 14 words. Every one must be different — never repeat a generic line. Mention the place naturally in some of them. Work a keyword in ONLY where it honestly describes the picture. Never guess a child's or a caregiver's name — say "a child", "two kids", "a caregiver".
+- a filename: kebab-case, descriptive, includes the place, no extension.
 
 Return ONLY JSON, no markdown fences:
 {"altTexts":["...", ...], "imageFilenames":["...", ...]}
