@@ -366,7 +366,7 @@ function mountBlogRoutes(app, cfg) {
     try {
       const { title, slug, contentHtml, excerpt, categories, featuredMediaId,
               status, metaDesc, focusKeyword, date,
-              jsonLd, blogCss, pageTemplate, clearElementor } = req.body || {};
+              jsonLd, blogCss, pageTemplate, clearElementor, postId } = req.body || {};
       if (!title || !contentHtml) return res.status(400).json({ error: 'missing title or content' });
       if (useBridge) {
         const b = await bridgeFetch('/publish', {
@@ -381,6 +381,9 @@ function mountBlogRoutes(app, cfg) {
           // ignores unknown keys, so the older CU plugin is unaffected.
           jsonLd: jsonLd || '', blogCss: blogCss || '',
           pageTemplate: pageTemplate || '', clearElementor: !!clearElementor,
+          // Set when the app is re-publishing a post it already made: the
+          // bridge updates that post in place instead of creating a second.
+          postId: Number(postId) || 0,
         });
         if (!b.ok) {
           console.error(base, 'bridge publish failed:', b.status, JSON.stringify(b.body).slice(0, 300));
@@ -390,6 +393,7 @@ function mountBlogRoutes(app, cfg) {
         return res.json({
           id: b.body.id, link: b.body.link,
           status: b.body.status, date: b.body.date,
+          updated: !!b.body.updated,
           yoastMetaApplied: !!b.body.yoastMetaApplied,
           seoPlugin: b.body.seoPlugin || '',
           styleMoved: !!b.body.styleMoved,
