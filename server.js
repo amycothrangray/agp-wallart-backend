@@ -417,24 +417,35 @@ function mountBlogRoutes(app, cfg) {
       const meta = {};
       if (metaDesc) meta._yoast_wpseo_metadesc = metaDesc;
       if (focusKeyword) meta._yoast_wpseo_focuskw = focusKeyword;
-      let r = await wpFetch('/wp-json/wp/v2/posts', {
+
+      /* Stock WordPress REST: POST /posts creates, POST /posts/{id} updates.
+         When the app sends back the id of a post it made earlier, update that
+         one in place rather than making a second — the same behaviour the
+         bridge plugins have. If that post has since been trashed WordPress
+         answers 404 for it, and a fresh post is the right outcome then. */
+      const wantId = Number(postId) > 0 ? Number(postId) : 0;
+      let updated = false;
+      const send = async (path, body) => wpFetch(path, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.keys(meta).length ? { ...post, meta } : post),
+        body: JSON.stringify(body),
       });
-      let yoastMetaApplied = Object.keys(meta).length > 0;
-      if (!r.ok && Object.keys(meta).length) {
-        yoastMetaApplied = false;
-        r = await wpFetch('/wp-json/wp/v2/posts', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(post),
-        });
-      }
+      const attempt = async (path) => {
+        let out = await send(path, Object.keys(meta).length ? { ...post, meta } : post);
+        // Sites without the blog-meta plugin reject unknown meta keys; retry bare.
+        if (!out.ok && Object.keys(meta).length && out.status !== 404) out = await send(path, post);
+        return out;
+      };
+      let r = wantId ? await attempt('/wp-json/wp/v2/posts/' + wantId) : null;
+      if (r && r.ok) updated = true;
+      if (!r || r.status === 404) r = await attempt('/wp-json/wp/v2/posts');
+      const yoastMetaApplied = r.ok && Object.keys(meta).length > 0 &&
+        !!(r.body && r.body.meta && (r.body.meta._yoast_wpseo_metadesc || r.body.meta._yoast_wpseo_focuskw));
       if (!r.ok) {
         console.error(base, 'publish failed:', r.status, JSON.stringify(r.body).slice(0, 300));
         return res.status(502).json({ error: 'WordPress rejected the post' });
       }
       siteCache = { at: 0, data: null };
-      res.json({ id: r.body.id, link: r.body.link, yoastMetaApplied });
+      res.json({ id: r.body.id, link: r.body.link, status: r.body.status, updated, yoastMetaApplied });
     } catch (err) {
       console.error(base, 'publish failed:', err.message);
       res.status(500).json({ error: 'publish failed' });
