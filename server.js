@@ -3,21 +3,55 @@
      SMTP_USER  — the Gmail address that sends the mail (amy@amygray.net)
      SMTP_PASS  — a Google "app password" for that account (SECRET)
      MAIL_TO    — where designs land (defaults to amy@amygray.net)
-     ALLOW_ORIGIN — the app's origin (defaults to the GitHub Pages site) */
+     ALLOW_ORIGIN — comma-separated list of extra origins allowed to call this
+                    API. The GitHub Pages origin is always allowed, so a typo
+                    here can never take the photography or school apps down. */
 'use strict';
 const express = require('express');
 const nodemailer = require('nodemailer');
 
 const app = express();
-app.use(express.json({ limit: '30mb' }));
 
-const ORIGIN = process.env.ALLOW_ORIGIN || 'https://amycothrangray.github.io';
+/* Every app talking to this backend is a static site on someone else's host, so
+   CORS has to name them one by one. The apps are not all in the same place any
+   more — the photography and school builders sit on GitHub Pages, the Sitterwise
+   one on Netlify — so this is a list rather than the single origin it used to
+   be. GitHub Pages is hard-coded rather than defaulted, so setting ALLOW_ORIGIN
+   for one app cannot knock the other two offline. */
+const ALLOWED_ORIGINS = [...new Set([
+  'https://amycothrangray.github.io',
+  ...String(process.env.ALLOW_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean),
+])];
 app.use((req, res, next) => {
-  res.set('Access-Control-Allow-Origin', ORIGIN);
-  res.set('Access-Control-Allow-Headers', 'Content-Type, X-AGP-Key, X-CU-Key');
+  const origin = req.get('Origin');
+  // A browser rejects a list in this header — it has to be one exact value —
+  // so echo back the caller's own origin when it is one we know.
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.set('Access-Control-Allow-Origin', origin);
+  } else if (!origin) {
+    res.set('Access-Control-Allow-Origin', ALLOWED_ORIGINS[0]);
+  }
+  // Without this a shared cache could hand one app another app's CORS headers.
+  res.set('Vary', 'Origin');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, X-AGP-Key, X-CU-Key, X-SW-Key');
   res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
+});
+
+/* After the CORS headers, deliberately. express.json() rejects a malformed or
+   oversized body itself, and anything it answers before the CORS middleware has
+   run carries no Access-Control headers — so the browser refuses to show the
+   page the status and reports it as a bare network failure instead. */
+app.use(express.json({ limit: '30mb' }));
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    return res.status(413).json({ error: 'those documents are too big to send' });
+  }
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'the request body was not valid JSON' });
+  }
+  return next(err);
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
